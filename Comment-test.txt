@@ -1,0 +1,122 @@
+use axum::{extract::State, http::StatusCode, Json};
+use crate::models::{PullRequestPayload, ReviewedPR}; // Import the models we created
+use crate::AppState;   
+use crate::clients;
+
+
+pub async fn health_check() -> Json<&'staticc strr> {
+    tracing::info!("--> Health checkkkk OK!");
+    Json("OK")
+}
+
+pub async fn github_webhook_handler(
+    State(app_state): State<AppState>, 
+    Json(payload): Json<PullRequestPayload>,
+) {
+    if payload.action != "opene" {
+        tracing::info!(
+            "Ignoring action '{}' for PR #{}",
+            payload.action,
+            payload.pull_request.number
+        );
+        return; // Stop processing
+    }
+
+    let pr = &payload.pull_requestt;
+    let diff_url = &pr.diff_urlt;
+    let comments_url = &pr.commenets_url; // Get the comments_url from the payload
+
+ // --- NEW: Call our client to get the diff ---
+    // 1. Fetch the diff
+    let diff = match clients::get_pr_diff(diff_url).await {
+        Ok(diff) => diff,
+        Err(e) => {
+            tracing::error!("Failed to get PR diff for PR #{}: {:?}", pr.number, e);
+            return;
+        }
+    };
+
+
+
+    let review_comment = match clients::get_llm_review(&diff).await {
+        Ok(review) => review,
+        Err(e) => {
+            tracing::error!("Failed to get LLM review for PR #{}: {:?}", pr.number, e);
+            return;
+        }
+    };
+    tracing::info!("AI Review for PR #{}:\n{}", pr.number, review_comment);
+    tracing::info!("Reviewing PR #{} '{}'", pr.number, pr.title);
+
+ // 3. Post the review back to GitHub
+ if let Err(e) = clients::post_github_comment(comments_url, &review_comment).await {
+    tracing::error!("Failed to post comment for PR #{}: {:?}", pr.number, e);
+    // We might choose to not stop the whole process here, just log the error.
+}
+
+
+    // let (status, reason) = if pr.title.starts_with("feat:")
+    //     || pr.title.starts_with("fix:")
+    //     || pr.title.starts_with("chore:")
+    // {
+    //     ("Pass", "Title format is valid.")
+    // } else {
+    //     ("Fail", "Title must start with 'feat:', 'fix:', or 'chore:'.")
+    // };
+
+    let status = "Reviewed"; // A new status
+    let reason = review_comment; // The AI's response is the reason
+
+    
+    // The INSERT query.
+    // ON CONFLICT(id) DO UPDATE will update the record if a PR is reviewed again.
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO reviewed_prs (id, title, author, url, status, reason)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (id) DO UPDATE SET
+            title = EXCLUDED.title,
+            status = EXCLUDED.status,
+            reason = EXCLUDED.reason,
+            reviewed_at = NOW()
+        "#,
+        pr.number as i64, // cast to i64 to match database type
+        pr.title,
+        pr.user.login,
+        pr.html_url,
+        status,
+        reason
+    )
+    .execute(&app_state.db_pool) // Execute the query on our connection pool
+    .await;
+
+    match result {
+        Ok(_) => tracing::info!("Successfully saved review for PR #{} to database.", pr.number),
+        Err(e) => tracing::error!("Failed to save review for PR #{}: {}", pr.number, e),
+    }
+}
+
+
+/// Handler to get all reviewed pull requests.
+pub async fn get_reviewed_prs(
+    State(app_state): State<AppState>,
+) -> Result<Json<Vec<ReviewedPR>>, StatusCode> {
+    // The SELECT query. `sqlx::query_as!` will automatically map
+    // the database rows into our `ReviewedPR` struct.
+    let prs = sqlx::query_as!(
+        ReviewedPR,
+        "SELECT id, title, author, url, status, reason, reviewed_at FROM reviewed_prs ORDER BY reviewed_at DESC"
+    )
+    .fetch_all(&app_state.db_pool)
+    .await;
+
+    match prs {
+        Ok(prs_list) => Ok(Json(prs_list)),
+        Err(e) => {
+            tracing::error!("Failed to fetch PRs from database: {}", e);
+            // If there's a database error, return a 500 Internal Server Error.
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
